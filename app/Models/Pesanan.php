@@ -2,8 +2,12 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 
 class Pesanan extends Model
 {
@@ -15,24 +19,50 @@ class Pesanan extends Model
         'jarak_km', 'status', 'pembayaran', 'sudah_bayar',
     ];
 
-    public function user()
+    // ─── Relationships ───────────────────────────────────────
+
+    public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
     }
 
-    public function mitra()
+    public function mitra(): BelongsTo
     {
         return $this->belongsTo(Mitra::class);
     }
 
-    public function rating()
+    public function rating(): HasOne
     {
         return $this->hasOne(Rating::class);
     }
 
+    public function chats(): HasMany
+    {
+        return $this->hasMany(Chat::class);
+    }
+
+    // ─── Scopes ──────────────────────────────────────────────
+
+    public function scopeAktif(Builder $query): Builder
+    {
+        return $query->whereNotIn('status', ['selesai', 'dibatalkan']);
+    }
+
+    public function scopeSelesai(Builder $query): Builder
+    {
+        return $query->where('status', 'selesai');
+    }
+
+    public function scopeMencariMitra(Builder $query): Builder
+    {
+        return $query->where('status', 'mencari_mitra')->whereNull('mitra_id');
+    }
+
+    // ─── Accessors ───────────────────────────────────────────
+
     public function getNamaLayananAttribute(): string
     {
-        return match($this->layanan) {
+        return match ($this->layanan) {
             'tambal-ban' => 'Tambal Ban Motor',
             'isi-angin' => 'Isi Angin / Nitrogen',
             'ganti-ban' => 'Ganti Ban Motor',

@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class Rating extends Model
 {
@@ -13,17 +14,17 @@ class Rating extends Model
         'pesanan_id', 'user_id', 'mitra_id', 'bintang', 'ulasan',
     ];
 
-    public function pesanan()
+    public function pesanan(): BelongsTo
     {
         return $this->belongsTo(Pesanan::class);
     }
 
-    public function user()
+    public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
     }
 
-    public function mitra()
+    public function mitra(): BelongsTo
     {
         return $this->belongsTo(Mitra::class);
     }

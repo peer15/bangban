@@ -2,29 +2,29 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Requests\LoginRequest;
+use App\Http\Requests\RegisterRequest;
 use App\Models\User;
-use Illuminate\Http\Request;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\View\View;
 
 class AuthController extends Controller
 {
-    public function showLogin()
+    public function showLogin(): View
     {
         return view('auth.login');
     }
 
-    public function login(Request $request)
+    public function login(LoginRequest $request): RedirectResponse
     {
-        $credentials = $request->validate([
-            'email' => 'required|email',
-            'password' => 'required',
-        ]);
+        $credentials = $request->validated();
 
         if (Auth::attempt($credentials, $request->boolean('remember'))) {
             $request->session()->regenerate();
 
-            return match(auth()->user()->role) {
+            return match (auth()->user()->role) {
                 'admin' => redirect('/admin'),
                 'mitra' => redirect('/mitra'),
                 default => redirect('/'),
@@ -34,20 +34,13 @@ class AuthController extends Controller
         return back()->withErrors(['email' => 'Email atau password salah.'])->onlyInput('email');
     }
 
-    public function showRegister()
+    public function showRegister(): View
     {
         return view('auth.register');
     }
 
-    public function register(Request $request)
+    public function register(RegisterRequest $request): RedirectResponse
     {
-        $request->validate([
-            'name' => 'required|string|max:255',
-            'email' => 'required|email|unique:users',
-            'phone' => 'required|string|max:20',
-            'password' => 'required|min:6|confirmed',
-        ]);
-
         $user = User::create([
             'name' => $request->name,
             'email' => $request->email,
@@ -61,11 +54,11 @@ class AuthController extends Controller
         return redirect('/');
     }
 
-    public function logout(Request $request)
+    public function logout(): RedirectResponse
     {
         Auth::logout();
-        $request->session()->invalidate();
-        $request->session()->regenerateToken();
+        request()->session()->invalidate();
+        request()->session()->regenerateToken();
 
         return redirect('/login');
     }

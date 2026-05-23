@@ -2,122 +2,66 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Requests\SendChatRequest;
 use App\Models\Chat;
 use App\Models\Pesanan;
-use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\View\View;
 
 class ChatController extends Controller
 {
-    /**
-     * User inbox - list all chat conversations
-     */
-    public function userInbox()
+    public function userInbox(): View
     {
-        $pesanans = Pesanan::where('user_id', auth()->id())
-            ->whereNotNull('mitra_id')
-            ->with(['mitra.user'])
-            ->orderBy('created_at', 'desc')
-            ->get()
-            ->map(function ($pesanan) {
-                $lastChat = Chat::where('pesanan_id', $pesanan->id)->latest()->first();
-                $unread = Chat::where('pesanan_id', $pesanan->id)
-                    ->where('sender_role', 'mitra')
-                    ->where('is_read', false)
-                    ->count();
-                $pesanan->last_chat = $lastChat;
-                $pesanan->unread_count = $unread;
-                return $pesanan;
-            })
-            ->sortByDesc(function ($p) {
-                return $p->last_chat ? $p->last_chat->created_at : $p->created_at;
-            });
+        $pesanans = $this->getInboxPesanans(
+            query: Pesanan::where('user_id', auth()->id())->whereNotNull('mitra_id'),
+            unreadRole: 'mitra',
+            relations: ['mitra.user']
+        );
 
         return view('user.chat-list', compact('pesanans'));
     }
 
-    /**
-     * Mitra inbox - list all chat conversations
-     */
-    public function mitraInbox()
+    public function mitraInbox(): View
     {
         $mitra = auth()->user()->mitra;
-        $pesanans = Pesanan::where('mitra_id', $mitra->id)
-            ->with(['user'])
-            ->orderBy('created_at', 'desc')
-            ->get()
-            ->map(function ($pesanan) {
-                $lastChat = Chat::where('pesanan_id', $pesanan->id)->latest()->first();
-                $unread = Chat::where('pesanan_id', $pesanan->id)
-                    ->where('sender_role', 'user')
-                    ->where('is_read', false)
-                    ->count();
-                $pesanan->last_chat = $lastChat;
-                $pesanan->unread_count = $unread;
-                return $pesanan;
-            })
-            ->sortByDesc(function ($p) {
-                return $p->last_chat ? $p->last_chat->created_at : $p->created_at;
-            });
+
+        $pesanans = $this->getInboxPesanans(
+            query: Pesanan::where('mitra_id', $mitra->id),
+            unreadRole: 'user',
+            relations: ['user']
+        );
 
         return view('mitra.chat-list', compact('pesanans'));
     }
 
-    /**
-     * Chat page for user
-     */
-    public function userChat(Pesanan $pesanan)
+    public function userChat(Pesanan $pesanan): View
     {
         abort_if($pesanan->user_id !== auth()->id(), 403);
         abort_if(!$pesanan->mitra_id, 404, 'Mitra belum ditemukan');
 
-        // Mark mitra messages as read
-        Chat::where('pesanan_id', $pesanan->id)
-            ->where('sender_role', 'mitra')
-            ->where('is_read', false)
-            ->update(['is_read' => true]);
-
-        $chats = Chat::where('pesanan_id', $pesanan->id)
-            ->with('sender')
-            ->orderBy('created_at', 'asc')
-            ->get();
-
+        $this->markAsRead($pesanan->id, 'mitra');
+        $chats = $this->getChatMessages($pesanan->id);
         $pesanan->load('mitra.user');
 
         return view('user.chat', compact('pesanan', 'chats'));
     }
 
-    /**
-     * Chat page for mitra
-     */
-    public function mitraChat(Pesanan $pesanan)
+    public function mitraChat(Pesanan $pesanan): View
     {
         $mitra = auth()->user()->mitra;
         abort_if($pesanan->mitra_id !== $mitra->id, 403);
 
-        // Mark user messages as read
-        Chat::where('pesanan_id', $pesanan->id)
-            ->where('sender_role', 'user')
-            ->where('is_read', false)
-            ->update(['is_read' => true]);
-
-        $chats = Chat::where('pesanan_id', $pesanan->id)
-            ->with('sender')
-            ->orderBy('created_at', 'asc')
-            ->get();
-
+        $this->markAsRead($pesanan->id, 'user');
+        $chats = $this->getChatMessages($pesanan->id);
         $pesanan->load('user');
 
         return view('mitra.chat', compact('pesanan', 'chats'));
     }
 
-    /**
-     * Send message (user)
-     */
-    public function userSend(Request $request, Pesanan $pesanan)
+    public function userSend(SendChatRequest $request, Pesanan $pesanan): JsonResponse|RedirectResponse
     {
         abort_if($pesanan->user_id !== auth()->id(), 403);
-
-        $request->validate(['message' => 'required|string|max:1000']);
 
         $chat = Chat::create([
             'pesanan_id' => $pesanan->id,
@@ -133,15 +77,10 @@ class ChatController extends Controller
         return back();
     }
 
-    /**
-     * Send message (mitra)
-     */
-    public function mitraSend(Request $request, Pesanan $pesanan)
+    public function mitraSend(SendChatRequest $request, Pesanan $pesanan): JsonResponse|RedirectResponse
     {
         $mitra = auth()->user()->mitra;
         abort_if($pesanan->mitra_id !== $mitra->id, 403);
-
-        $request->validate(['message' => 'required|string|max:1000']);
 
         $chat = Chat::create([
             'pesanan_id' => $pesanan->id,
@@ -157,53 +96,35 @@ class ChatController extends Controller
         return back();
     }
 
-    /**
-     * API: Get new messages (for polling)
-     */
-    public function getMessages(Pesanan $pesanan)
+    public function getMessages(Pesanan $pesanan): JsonResponse
     {
         $user = auth()->user();
 
-        // Verify access
         if ($user->role === 'user') {
             abort_if($pesanan->user_id !== $user->id, 403);
-            // Mark mitra messages as read
-            Chat::where('pesanan_id', $pesanan->id)
-                ->where('sender_role', 'mitra')
-                ->where('is_read', false)
-                ->update(['is_read' => true]);
+            $this->markAsRead($pesanan->id, 'mitra');
         } else {
-            $mitra = $user->mitra;
-            abort_if($pesanan->mitra_id !== $mitra->id, 403);
-            // Mark user messages as read
-            Chat::where('pesanan_id', $pesanan->id)
-                ->where('sender_role', 'user')
-                ->where('is_read', false)
-                ->update(['is_read' => true]);
+            abort_if($pesanan->mitra_id !== $user->mitra?->id, 403);
+            $this->markAsRead($pesanan->id, 'user');
         }
 
         $chats = Chat::where('pesanan_id', $pesanan->id)
             ->with('sender')
             ->orderBy('created_at', 'asc')
             ->get()
-            ->map(function ($chat) {
-                return [
-                    'id' => $chat->id,
-                    'message' => $chat->message,
-                    'sender_role' => $chat->sender_role,
-                    'sender_name' => $chat->sender->name,
-                    'time' => $chat->created_at->format('H:i'),
-                    'is_read' => $chat->is_read,
-                ];
-            });
+            ->map(fn (Chat $chat) => [
+                'id' => $chat->id,
+                'message' => $chat->message,
+                'sender_role' => $chat->sender_role,
+                'sender_name' => $chat->sender->name,
+                'time' => $chat->created_at->format('H:i'),
+                'is_read' => $chat->is_read,
+            ]);
 
         return response()->json($chats);
     }
 
-    /**
-     * Unread count for specific pesanan
-     */
-    public function unreadCount(Pesanan $pesanan)
+    public function unreadCount(Pesanan $pesanan): JsonResponse
     {
         $user = auth()->user();
         $role = $user->role === 'user' ? 'mitra' : 'user';
@@ -216,50 +137,68 @@ class ChatController extends Controller
         return response()->json(['count' => $count]);
     }
 
-    /**
-     * Global unread count (all active pesanan) - for navbar badge
-     */
-    public function globalUnread()
+    public function globalUnread(): JsonResponse
     {
         $user = auth()->user();
 
         if ($user->role === 'user') {
-            // Count unread messages from mitra in all active pesanan
             $activePesananIds = Pesanan::where('user_id', $user->id)
                 ->whereNotIn('status', ['selesai', 'dibatalkan'])
                 ->whereNotNull('mitra_id')
                 ->pluck('id');
-
-            $count = Chat::whereIn('pesanan_id', $activePesananIds)
-                ->where('sender_role', 'mitra')
-                ->where('is_read', false)
-                ->count();
-
-            // Get pesanan_id for redirect
-            $pesananId = Chat::whereIn('pesanan_id', $activePesananIds)
-                ->where('sender_role', 'mitra')
-                ->where('is_read', false)
-                ->latest()
-                ->value('pesanan_id');
+            $senderRole = 'mitra';
         } else {
-            // Mitra: count unread from users
-            $mitra = $user->mitra;
-            $activePesananIds = Pesanan::where('mitra_id', $mitra?->id)
+            $activePesananIds = Pesanan::where('mitra_id', $user->mitra?->id)
                 ->whereNotIn('status', ['selesai', 'dibatalkan'])
                 ->pluck('id');
-
-            $count = Chat::whereIn('pesanan_id', $activePesananIds)
-                ->where('sender_role', 'user')
-                ->where('is_read', false)
-                ->count();
-
-            $pesananId = Chat::whereIn('pesanan_id', $activePesananIds)
-                ->where('sender_role', 'user')
-                ->where('is_read', false)
-                ->latest()
-                ->value('pesanan_id');
+            $senderRole = 'user';
         }
 
+        $count = Chat::whereIn('pesanan_id', $activePesananIds)
+            ->where('sender_role', $senderRole)
+            ->where('is_read', false)
+            ->count();
+
+        $pesananId = Chat::whereIn('pesanan_id', $activePesananIds)
+            ->where('sender_role', $senderRole)
+            ->where('is_read', false)
+            ->latest()
+            ->value('pesanan_id');
+
         return response()->json(['count' => $count, 'pesanan_id' => $pesananId]);
+    }
+
+    // ─── Private Helpers ─────────────────────────────────────
+
+    private function getInboxPesanans($query, string $unreadRole, array $relations)
+    {
+        return $query->with($relations)
+            ->orderBy('created_at', 'desc')
+            ->get()
+            ->map(function (Pesanan $pesanan) use ($unreadRole) {
+                $pesanan->last_chat = Chat::where('pesanan_id', $pesanan->id)->latest()->first();
+                $pesanan->unread_count = Chat::where('pesanan_id', $pesanan->id)
+                    ->where('sender_role', $unreadRole)
+                    ->where('is_read', false)
+                    ->count();
+                return $pesanan;
+            })
+            ->sortByDesc(fn ($p) => $p->last_chat?->created_at ?? $p->created_at);
+    }
+
+    private function markAsRead(int $pesananId, string $senderRole): void
+    {
+        Chat::where('pesanan_id', $pesananId)
+            ->where('sender_role', $senderRole)
+            ->where('is_read', false)
+            ->update(['is_read' => true]);
+    }
+
+    private function getChatMessages(int $pesananId)
+    {
+        return Chat::where('pesanan_id', $pesananId)
+            ->with('sender')
+            ->orderBy('created_at', 'asc')
+            ->get();
     }
 }

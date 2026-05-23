@@ -2,23 +2,40 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Requests\DaftarMitraRequest;
+use App\Http\Requests\UpdateMitraProfilRequest;
 use App\Models\Mitra;
 use App\Models\Pesanan;
+use App\Models\SaldoMitra;
 use App\Models\User;
+use App\Services\PesananService;
+use App\Services\SaldoService;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\View\View;
 
 class MitraController extends Controller
 {
-    public function dashboard()
+    public function __construct(
+        private readonly PesananService $pesananService,
+        private readonly SaldoService $saldoService,
+    ) {}
+
+    public function dashboard(): View
     {
         $mitra = auth()->user()->mitra;
+
         $pesananMasuk = Pesanan::where('mitra_id', $mitra?->id)
             ->whereIn('status', ['mencari_mitra', 'mitra_menuju', 'dikerjakan'])
             ->orderBy('created_at', 'desc')
             ->get();
+
         $totalSelesai = Pesanan::where('mitra_id', $mitra?->id)->where('status', 'selesai')->count();
+
         $pendapatanBulan = Pesanan::where('mitra_id', $mitra?->id)
             ->where('status', 'selesai')
             ->where('sudah_bayar', true)
@@ -26,7 +43,7 @@ class MitraController extends Controller
             ->sum('total_biaya');
 
         // Auto set is_ready berdasarkan ada pesanan aktif atau tidak
-        if ($mitra && $mitra->status === 'aktif') {
+        if ($mitra?->status === 'aktif') {
             $adaPesananAktif = Pesanan::where('mitra_id', $mitra->id)
                 ->whereIn('status', ['mitra_menuju', 'dikerjakan'])
                 ->exists();
@@ -36,17 +53,22 @@ class MitraController extends Controller
         return view('mitra.dashboard', compact('mitra', 'pesananMasuk', 'totalSelesai', 'pendapatanBulan'));
     }
 
-    public function toggleOpen()
+    public function toggleOpen(): RedirectResponse
     {
         $mitra = auth()->user()->mitra;
         $mitra->update(['is_open' => !$mitra->is_open]);
 
-        return back()->with('success', $mitra->is_open ? 'Toko dibuka! Kamu bisa menerima pesanan.' : 'Toko ditutup.');
+        $message = $mitra->is_open
+            ? 'Toko dibuka! Kamu bisa menerima pesanan.'
+            : 'Toko ditutup.';
+
+        return back()->with('success', $message);
     }
 
-    public function pesananMasuk()
+    public function pesananMasuk(): View
     {
         $mitra = auth()->user()->mitra;
+
         $pesanans = Pesanan::where('status', 'mencari_mitra')
             ->whereNull('mitra_id')
             ->with('user')
@@ -56,12 +78,10 @@ class MitraController extends Controller
         return view('mitra.pesanan', compact('pesanans', 'mitra'));
     }
 
-    /**
-     * API: Check for incoming orders (polling for popup)
-     */
-    public function checkIncoming()
+    public function checkIncoming(): JsonResponse
     {
         $mitra = auth()->user()->mitra;
+
         if (!$mitra || $mitra->status !== 'aktif' || !$mitra->is_open) {
             return response()->json(['has_order' => false]);
         }
@@ -76,16 +96,14 @@ class MitraController extends Controller
             return response()->json(['has_order' => false]);
         }
 
-        // Calculate distance if mitra has coordinates
         $jarak = null;
         if ($mitra->latitude && $mitra->longitude && $pesanan->latitude && $pesanan->longitude) {
-            $jarak = round(6371 * acos(
-                cos(deg2rad($mitra->latitude)) *
-                cos(deg2rad($pesanan->latitude)) *
-                cos(deg2rad($pesanan->longitude) - deg2rad($mitra->longitude)) +
-                sin(deg2rad($mitra->latitude)) *
-                sin(deg2rad($pesanan->latitude))
-            ), 1);
+            $jarak = $this->pesananService->hitungJarak(
+                $mitra->latitude,
+                $mitra->longitude,
+                $pesanan->latitude,
+                $pesanan->longitude
+            );
         }
 
         return response()->json([
@@ -103,7 +121,7 @@ class MitraController extends Controller
         ]);
     }
 
-    public function terimaPesanan(Pesanan $pesanan)
+    public function terimaPesanan(Pesanan $pesanan): RedirectResponse
     {
         $mitra = auth()->user()->mitra;
         abort_if(!$mitra || $mitra->status !== 'aktif', 403);
@@ -116,36 +134,23 @@ class MitraController extends Controller
         return redirect('/mitra/pesanan')->with('success', 'Pesanan diterima!');
     }
 
-    public function updateStatus(Request $request, Pesanan $pesanan)
+    public function updateStatus(Request $request, Pesanan $pesanan): RedirectResponse
     {
         $mitra = auth()->user()->mitra;
         abort_if($pesanan->mitra_id !== $mitra->id, 403);
 
         $request->validate(['status' => 'required|in:mitra_menuju,dikerjakan,selesai']);
 
-        $pesanan->update(['status' => $request->status]);
-
         if ($request->status === 'selesai') {
-            $pesanan->update(['sudah_bayar' => true]);
-            $mitra->increment('total_layanan');
-
-            // Jika pembayaran online, tambah saldo mitra
-            if ($pesanan->pembayaran === 'ewallet') {
-                \App\Models\SaldoMitra::create([
-                    'mitra_id' => $mitra->id,
-                    'pesanan_id' => $pesanan->id,
-                    'jenis' => 'masuk',
-                    'jumlah' => $pesanan->total_biaya,
-                    'keterangan' => 'Pesanan #' . $pesanan->id . ' - ' . $pesanan->nama_layanan,
-                ]);
-                $mitra->increment('saldo', $pesanan->total_biaya);
-            }
+            $this->pesananService->selesaikanPesanan($pesanan, $mitra);
+        } else {
+            $pesanan->update(['status' => $request->status]);
         }
 
         return back()->with('success', 'Status diperbarui!');
     }
 
-    public function cancelPesanan(Pesanan $pesanan)
+    public function cancelPesanan(Pesanan $pesanan): RedirectResponse
     {
         $mitra = auth()->user()->mitra;
         abort_if($pesanan->mitra_id !== $mitra->id, 403);
@@ -159,39 +164,29 @@ class MitraController extends Controller
         return back()->with('success', 'Pesanan dibatalkan.');
     }
 
-    public function saldo()
+    public function saldo(): View
     {
         $mitra = auth()->user()->mitra;
-        $riwayat = \App\Models\SaldoMitra::where('mitra_id', $mitra->id)
+        $riwayat = SaldoMitra::where('mitra_id', $mitra->id)
             ->orderBy('created_at', 'desc')
             ->paginate(15);
 
         return view('mitra.saldo', compact('mitra', 'riwayat'));
     }
 
-    public function cairkanSaldo()
+    public function cairkanSaldo(): RedirectResponse
     {
         $mitra = auth()->user()->mitra;
-        abort_if($mitra->saldo < 50000, 403, 'Saldo minimum pencairan Rp 50.000');
+        $result = $this->saldoService->cairkan($mitra);
 
-        $jumlah = $mitra->saldo;
-        $potongan = (int) ceil($jumlah * 0.01); // 1% potongan
-        $diterima = $jumlah - $potongan;
+        $message = "Pencairan diproses! Total Rp " . number_format($result['jumlah'], 0, ',', '.') .
+            " - Potongan 1% (Rp " . number_format($result['potongan'], 0, ',', '.') .
+            ") = Diterima Rp " . number_format($result['diterima'], 0, ',', '.');
 
-        \App\Models\SaldoMitra::create([
-            'mitra_id' => $mitra->id,
-            'jenis' => 'pencairan',
-            'jumlah' => $diterima,
-            'keterangan' => 'Pencairan Rp ' . number_format($jumlah, 0, ',', '.') . ' - Potongan 1% (Rp ' . number_format($potongan, 0, ',', '.') . ')',
-            'status' => 'pending',
-        ]);
-
-        $mitra->update(['saldo' => 0]);
-
-        return back()->with('success', 'Pencairan diproses! Total Rp ' . number_format($jumlah, 0, ',', '.') . ' - Potongan 1% (Rp ' . number_format($potongan, 0, ',', '.') . ') = Diterima Rp ' . number_format($diterima, 0, ',', '.'));
+        return back()->with('success', $message);
     }
 
-    public function riwayat()
+    public function riwayat(): View
     {
         $mitra = auth()->user()->mitra;
         $pesanans = Pesanan::where('mitra_id', $mitra->id)
@@ -202,37 +197,23 @@ class MitraController extends Controller
         return view('mitra.riwayat', compact('pesanans'));
     }
 
-    public function profil()
+    public function profil(): View
     {
         $mitra = auth()->user()->mitra;
         return view('mitra.profil', compact('mitra'));
     }
 
-    public function updateProfil(Request $request)
+    public function updateProfil(UpdateMitraProfilRequest $request): RedirectResponse
     {
-        $request->validate([
-            'nama_usaha' => 'nullable|string|max:255',
-            'alamat' => 'required|string',
-            'latitude' => 'nullable|numeric',
-            'longitude' => 'nullable|numeric',
-            'layanan' => 'required|array',
-            'jam_buka' => 'nullable',
-            'jam_tutup' => 'nullable',
-            'foto_usaha' => 'nullable|image|mimes:jpg,jpeg,png|max:2048',
-            'jenis_rekening' => 'nullable|string|max:50',
-            'nomor_rekening' => 'nullable|string|max:50',
-            'nama_rekening' => 'nullable|string|max:255',
-        ]);
-
         $mitra = auth()->user()->mitra;
         $data = $request->only([
-            'nama_usaha', 'alamat', 'latitude', 'longitude', 'layanan', 'jam_buka', 'jam_tutup',
-            'jenis_rekening', 'nomor_rekening', 'nama_rekening',
+            'nama_usaha', 'alamat', 'latitude', 'longitude', 'layanan',
+            'jam_buka', 'jam_tutup', 'jenis_rekening', 'nomor_rekening', 'nama_rekening',
         ]);
 
         if ($request->hasFile('foto_usaha')) {
-            if ($mitra->foto_usaha && \Storage::disk('public')->exists($mitra->foto_usaha)) {
-                \Storage::disk('public')->delete($mitra->foto_usaha);
+            if ($mitra->foto_usaha && Storage::disk('public')->exists($mitra->foto_usaha)) {
+                Storage::disk('public')->delete($mitra->foto_usaha);
             }
             $data['foto_usaha'] = $request->file('foto_usaha')->store('foto-usaha', 'public');
         }
@@ -242,17 +223,16 @@ class MitraController extends Controller
         return back()->with('success', 'Profil diperbarui!');
     }
 
-    public function updateFotoProfil(Request $request)
+    public function updateFotoProfil(Request $request): RedirectResponse
     {
         $request->validate([
-            'foto_profil' => 'required|image|mimes:jpg,jpeg,png|max:2048',
+            'foto_profil' => ['required', 'image', 'mimes:jpg,jpeg,png', 'max:2048'],
         ]);
 
         $user = auth()->user();
 
-        // Hapus foto lama
-        if ($user->foto_profil && \Storage::disk('public')->exists($user->foto_profil)) {
-            \Storage::disk('public')->delete($user->foto_profil);
+        if ($user->foto_profil && Storage::disk('public')->exists($user->foto_profil)) {
+            Storage::disk('public')->delete($user->foto_profil);
         }
 
         $path = $request->file('foto_profil')->store('foto-profil', 'public');
@@ -261,28 +241,13 @@ class MitraController extends Controller
         return back()->with('success', 'Foto profil berhasil diperbarui!');
     }
 
-    // Form pendaftaran mitra (publik)
-    public function showDaftar()
+    public function showDaftar(): View
     {
         return view('mitra.daftar');
     }
 
-    public function daftar(Request $request)
+    public function daftar(DaftarMitraRequest $request): RedirectResponse
     {
-        $request->validate([
-            'name' => 'required|string|max:255',
-            'email' => 'required|email|unique:users',
-            'phone' => 'required|string|max:20',
-            'password' => 'required|min:6|confirmed',
-            'alamat' => 'required|string',
-            'layanan' => 'required|array',
-            'foto_usaha' => 'required|image|mimes:jpg,jpeg,png|max:2048',
-            'jam_buka' => 'nullable',
-            'jam_tutup' => 'nullable',
-            'latitude' => 'nullable|numeric',
-            'longitude' => 'nullable|numeric',
-        ]);
-
         $fotoPath = $request->file('foto_usaha')->store('foto-usaha', 'public');
 
         $user = User::create([

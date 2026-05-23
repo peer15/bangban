@@ -2,61 +2,61 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Mitra;
+use App\Http\Requests\PesananRequest;
+use App\Http\Requests\RatingRequest;
+use App\Http\Requests\UpdateProfilRequest;
 use App\Models\Pesanan;
 use App\Models\Rating;
+use App\Services\DokuService;
+use App\Services\PesananService;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\View\View;
 
 class UserController extends Controller
 {
-    public function home()
+    public function __construct(
+        private readonly PesananService $pesananService,
+    ) {}
+
+    public function home(): View
     {
-        // Cek apakah ada pesanan aktif
-        $pesananAktif = Pesanan::where('user_id', auth()->id())
+        $userId = auth()->id();
+
+        $pesananAktif = Pesanan::where('user_id', $userId)
             ->whereNotIn('status', ['selesai', 'dibatalkan'])
             ->first();
 
-        // Stats user
-        $totalPesanan = Pesanan::where('user_id', auth()->id())->count();
-        $pesananSelesai = Pesanan::where('user_id', auth()->id())->where('status', 'selesai')->count();
-        $totalPengeluaran = Pesanan::where('user_id', auth()->id())
+        $totalPesanan = Pesanan::where('user_id', $userId)->count();
+        $pesananSelesai = Pesanan::where('user_id', $userId)->where('status', 'selesai')->count();
+        $totalPengeluaran = Pesanan::where('user_id', $userId)
             ->where('status', 'selesai')
             ->sum('total_biaya');
 
         return view('user.home', compact('pesananAktif', 'totalPesanan', 'pesananSelesai', 'totalPengeluaran'));
     }
 
-    public function profil()
+    public function profil(): View
     {
         return view('user.profil');
     }
 
-    public function updateProfil(Request $request)
+    public function updateProfil(UpdateProfilRequest $request): RedirectResponse
     {
-        $user = auth()->user();
-
-        $request->validate([
-            'name' => 'required|string|max:255',
-            'email' => 'required|email|unique:users,email,' . $user->id,
-            'phone' => 'nullable|string|max:20',
-            'password' => 'nullable|min:6|confirmed',
-        ]);
-
         $data = $request->only(['name', 'email', 'phone']);
 
         if ($request->filled('password')) {
-            $data['password'] = \Hash::make($request->password);
+            $data['password'] = Hash::make($request->password);
         }
 
-        $user->update($data);
+        auth()->user()->update($data);
 
         return back()->with('success', 'Profil berhasil diperbarui!');
     }
 
-    public function pesan(Request $request)
+    public function pesan(Request $request): View|RedirectResponse
     {
-        // Cek apakah sudah ada pesanan aktif
         $pesananAktif = Pesanan::where('user_id', auth()->id())
             ->whereNotIn('status', ['selesai', 'dibatalkan'])
             ->first();
@@ -70,19 +70,15 @@ class UserController extends Controller
         $lat = $request->get('lat');
         $lng = $request->get('lng');
 
-        // Cari mitra terdekat dalam radius 5km menggunakan Haversine
-        if ($lat && $lng) {
-            $mitras = $this->getMitrasTerdekat($lat, $lng, 5, $layanan);
-        } else {
-            $mitras = collect();
-        }
+        $mitras = ($lat && $lng)
+            ? $this->pesananService->getMitrasTerdekat((float) $lat, (float) $lng, 5, $layanan)
+            : collect();
 
         return view('user.pesan', compact('layanan', 'mitras'));
     }
 
-    public function konfirmasiPesanan(Request $request)
+    public function konfirmasiPesanan(PesananRequest $request): RedirectResponse
     {
-        // Cek pesanan aktif
         $pesananAktif = Pesanan::where('user_id', auth()->id())
             ->whereNotIn('status', ['selesai', 'dibatalkan'])
             ->first();
@@ -91,59 +87,18 @@ class UserController extends Controller
             return redirect("/pesanan/{$pesananAktif->id}/tracking");
         }
 
-        $request->validate([
-            'layanan' => 'required|in:tambal-ban,isi-angin,ganti-ban',
-            'latitude' => 'required|numeric',
-            'longitude' => 'required|numeric',
-            'catatan_lokasi' => 'nullable|string|max:500',
-            'pembayaran' => 'required|in:tunai,ewallet',
-        ]);
-
-        $biayaLayanan = match($request->layanan) {
-            'tambal-ban' => 35000,
-            'isi-angin' => 5000,
-            'ganti-ban' => 80000,
-            default => 35000,
-        };
-
-        // Cari mitra terdekat (Haversine, max 5km) - untuk estimasi biaya panggil
-        $mitrasTerdekat = $this->getMitrasTerdekat(
-            $request->latitude,
-            $request->longitude,
-            5,
-            $request->layanan
-        );
-
-        $mitraTerdekat = $mitrasTerdekat->first();
-        $jarakKm = $mitraTerdekat ? $mitraTerdekat->jarak_km : null;
-
-        // Biaya panggil berdasarkan jarak (Rp 5.000 per km, min Rp 5.000)
-        $biayaPanggil = $jarakKm ? max(5000, ceil($jarakKm) * 5000) : 10000;
-        $totalBiaya = $biayaLayanan + $biayaPanggil;
-
-        // Pesanan dibuat dengan status mencari_mitra, mitra harus acc manual
-        $pesanan = Pesanan::create([
+        $pesanan = $this->pesananService->buatPesanan([
+            ...$request->validated(),
             'user_id' => auth()->id(),
-            'mitra_id' => null,
-            'layanan' => $request->layanan,
-            'latitude' => $request->latitude,
-            'longitude' => $request->longitude,
-            'catatan_lokasi' => $request->catatan_lokasi,
-            'biaya_layanan' => $biayaLayanan,
-            'biaya_panggil' => $biayaPanggil,
-            'total_biaya' => $totalBiaya,
-            'jarak_km' => $jarakKm,
-            'pembayaran' => $request->pembayaran,
-            'status' => 'mencari_mitra',
         ]);
 
         // Jika pilih ewallet, redirect ke DOKU payment
         if ($request->pembayaran === 'ewallet') {
-            $doku = app(\App\Services\DokuService::class);
+            $doku = app(DokuService::class);
             $user = auth()->user();
 
             $result = $doku->createPayment([
-                'amount' => $totalBiaya,
+                'amount' => $pesanan->total_biaya,
                 'customer_id' => $user->id,
                 'customer_name' => $user->name,
                 'customer_email' => $user->email,
@@ -151,8 +106,10 @@ class UserController extends Controller
             ]);
 
             if ($result['success'] && $result['payment_url']) {
-                // Simpan invoice di pesanan (bisa pakai catatan atau field baru)
-                $pesanan->update(['catatan_lokasi' => ($pesanan->catatan_lokasi ? $pesanan->catatan_lokasi . ' | ' : '') . 'INV:' . $result['invoice_number']]);
+                $pesanan->update([
+                    'catatan_lokasi' => ($pesanan->catatan_lokasi ? $pesanan->catatan_lokasi . ' | ' : '') . 'INV:' . $result['invoice_number'],
+                ]);
+
                 return redirect($result['payment_url']);
             }
         }
@@ -160,43 +117,7 @@ class UserController extends Controller
         return redirect("/pesanan/{$pesanan->id}/tracking");
     }
 
-    /**
-     * Cari mitra terdekat menggunakan Haversine Formula
-     *
-     * @param float $lat Latitude user
-     * @param float $lng Longitude user
-     * @param float $radiusKm Radius pencarian dalam km
-     * @param string|null $layanan Filter layanan tertentu
-     */
-    private function getMitrasTerdekat(float $lat, float $lng, float $radiusKm = 5, ?string $layanan = null)
-    {
-        $haversine = "(6371 * acos(
-            cos(radians(?)) *
-            cos(radians(latitude)) *
-            cos(radians(longitude) - radians(?)) +
-            sin(radians(?)) *
-            sin(radians(latitude))
-        ))";
-
-        $query = Mitra::select('mitras.*')
-            ->selectRaw("{$haversine} AS jarak_km", [$lat, $lng, $lat])
-            ->where('status', 'aktif')
-            ->where('is_open', true)
-            ->where('is_ready', true)
-            ->whereNotNull('latitude')
-            ->whereNotNull('longitude')
-            ->having('jarak_km', '<=', $radiusKm)
-            ->orderBy('jarak_km', 'asc');
-
-        // Filter berdasarkan layanan yang diminta
-        if ($layanan) {
-            $query->whereRaw("JSON_CONTAINS(layanan, ?)", [json_encode($layanan)]);
-        }
-
-        return $query->with('user')->limit(5)->get();
-    }
-
-    public function tracking(Pesanan $pesanan)
+    public function tracking(Pesanan $pesanan): View
     {
         abort_if($pesanan->user_id !== auth()->id(), 403);
         $pesanan->load('mitra.user');
@@ -204,7 +125,7 @@ class UserController extends Controller
         return view('user.tracking', compact('pesanan'));
     }
 
-    public function cancelPesanan(Pesanan $pesanan)
+    public function cancelPesanan(Pesanan $pesanan): RedirectResponse
     {
         abort_if($pesanan->user_id !== auth()->id(), 403);
         abort_if(in_array($pesanan->status, ['selesai', 'dibatalkan']), 403);
@@ -214,7 +135,7 @@ class UserController extends Controller
         return redirect('/riwayat')->with('success', 'Pesanan berhasil dibatalkan.');
     }
 
-    public function riwayat()
+    public function riwayat(): View
     {
         $pesanans = Pesanan::where('user_id', auth()->id())
             ->orderBy('created_at', 'desc')
@@ -223,7 +144,7 @@ class UserController extends Controller
         return view('user.riwayat', compact('pesanans'));
     }
 
-    public function showRating(Pesanan $pesanan)
+    public function showRating(Pesanan $pesanan): View
     {
         abort_if($pesanan->user_id !== auth()->id(), 403);
         abort_if($pesanan->status !== 'selesai', 404);
@@ -232,14 +153,9 @@ class UserController extends Controller
         return view('user.rating', compact('pesanan'));
     }
 
-    public function simpanRating(Request $request, Pesanan $pesanan)
+    public function simpanRating(RatingRequest $request, Pesanan $pesanan): RedirectResponse
     {
         abort_if($pesanan->user_id !== auth()->id(), 403);
-
-        $request->validate([
-            'bintang' => 'required|integer|min:1|max:5',
-            'ulasan' => 'nullable|string|max:1000',
-        ]);
 
         Rating::create([
             'pesanan_id' => $pesanan->id,
@@ -250,13 +166,12 @@ class UserController extends Controller
         ]);
 
         $mitra = $pesanan->mitra;
-        $mitra->rating = $mitra->ratings()->avg('bintang');
-        $mitra->save();
+        $mitra->update(['rating' => $mitra->ratings()->avg('bintang')]);
 
         return redirect('/')->with('success', 'Rating berhasil dikirim!');
     }
 
-    public function sos()
+    public function sos(): View
     {
         return view('user.sos');
     }
